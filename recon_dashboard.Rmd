@@ -1,0 +1,252 @@
+---
+title: "Cash Posting Reconciliation | Synthetic Data"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme:
+      version: 4
+      bootswatch: flatly
+      primary: "#1B365D"
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(flexdashboard)
+  library(dplyr)
+  library(arrow)
+  library(plotly)
+  library(DT)
+  library(crosstalk)
+})
+
+as_of  <- as.Date("2026-09-30")
+launch <- as.Date("2026-08-03")
+m      <- read_parquet("data/curated/matches.parquet")
+trend  <- read_parquet("data/curated/daily_unposted_trend.parquet")
+checks <- readRDS("data/curated/checks.rds")
+
+money <- function(x) {
+  ifelse(abs(x) >= 1e6, paste0("$", round(x / 1e6, 1), "M"),
+         ifelse(abs(x) >= 1e3, paste0("$", round(x / 1e3), "K"), paste0("$", round(x))))
+}
+pct <- function(x) paste0(round(100 * x), "%")
+
+open_items <- m |>
+  filter(result != "Matched") |>
+  mutate(age_bucket = cut(age_days, c(-1, 7, 30, 60, Inf),
+                          labels = c("0 to 7 days", "8 to 30 days", "31 to 60 days", "Over 60 days")))
+
+aged_at <- function(d) trend$aged_unposted[which.min(abs(trend$day - d))]
+change_3wk <- aged_at(launch + 21) / aged_at(launch) - 1
+
+reason_cols <- c("No matching posting" = "#B5473A", "Partial posting" = "#C9A227",
+                 "Amount variance" = "#6C8EBF", "Over posted or duplicate" = "#1B365D")
+
+plot_layout <- function(p, ...) {
+  p |> layout(font = list(family = "Helvetica", size = 12),
+              legend = list(orientation = "h", y = -0.2),
+              margin = list(t = 10, r = 60), ...) |>
+    config(displayModeBar = FALSE)
+}
+```
+
+Overview
+=====================================
+
+Row {data-height=120}
+-------------------------------------
+
+### Deposits matched to postings
+
+```{r}
+valueBox(pct(mean(m$result == "Matched")), icon = "fa-check-double", color = "primary")
+```
+
+### Deposit dollars matched
+
+```{r}
+valueBox(pct(sum(m$amount[m$result == "Matched"]) / sum(m$amount)),
+         icon = "fa-dollar-sign", color = "info")
+```
+
+### Open deposits needing work
+
+```{r}
+valueBox(paste("About", round(nrow(open_items), -1)), icon = "fa-inbox", color = "warning")
+```
+
+### Aged unposted cash, three weeks after launch
+
+```{r}
+valueBox(paste("Down", pct(-change_3wk)), icon = "fa-arrow-down", color = "success")
+```
+
+Row
+-------------------------------------
+
+### Unposted cash over 30 days old, by business day
+
+```{r}
+plot_ly(trend, x = ~day) |>
+  add_lines(y = ~aged_unposted, name = "Unposted over 30 days",
+            line = list(color = "#B5473A", width = 3), fill = "tozeroy",
+            fillcolor = "rgba(181,71,58,0.15)",
+            text = ~paste0(format(day, "%b %d"), ": ", money(aged_unposted)),
+            hoverinfo = "text") |>
+  add_lines(y = ~open_unposted, name = "All unposted cash",
+            line = list(color = "#1B365D", width = 1.5, dash = "dot"),
+            text = ~paste0(format(day, "%b %d"), ": ", money(open_unposted)),
+            hoverinfo = "text") |>
+  plot_layout(xaxis = list(title = ""), yaxis = list(title = "", tickprefix = "$"),
+              shapes = list(list(type = "line", x0 = launch, x1 = launch, y0 = 0, y1 = 1,
+                                 yref = "paper", line = list(color = "#C9A227", width = 2))),
+              annotations = list(list(x = launch, y = 1, yref = "paper", xanchor = "left",
+                                      text = " Daily reconciliation launched",
+                                      showarrow = FALSE, font = list(color = "#7A5C00"))))
+```
+
+### How deposits were matched
+
+```{r}
+m |>
+  mutate(method = case_when(result == "Matched" & match_method == "Reference" ~ "Matched by bank reference",
+                            result == "Matched" ~ "Matched by amount and date",
+                            TRUE ~ "Open item")) |>
+  count(method) |>
+  mutate(label = paste0(method, " (", ifelse(n / sum(n) < 0.01, "under 1%", pct(n / sum(n))), ")")) |>
+  plot_ly(labels = ~label, values = ~n, type = "pie", hole = 0.6, sort = FALSE,
+          marker = list(colors = c("#6C8EBF", "#1B365D", "#B5473A")),
+          textinfo = "none", hoverinfo = "label+value") |>
+  plot_layout()
+```
+
+Open items
+=====================================
+
+```{r}
+detail <- open_items |>
+  transmute(Deposit = deposit_id, `Deposit date` = deposit_date, Type = deposit_type,
+            `Bank reference` = bank_ref, Payer = payer_name, Owner = owner,
+            Facility = facility, Reason = result, Age = as.character(age_bucket),
+            `Days open` = age_days, Deposited = amount, Posted = posted,
+            Unposted = unposted)
+sd <- SharedData$new(detail)
+```
+
+Inputs {.sidebar data-width=260}
+-------------------------------------
+
+**Every deposit that does not tie out**, assigned to the team that owns the payer. Filter, then export the rows on screen.
+
+```{r}
+filter_checkbox("owner", "Owner", sd, ~Owner)
+filter_checkbox("reason", "Reason", sd, ~Reason)
+filter_select("age", "Age", sd, ~Age)
+filter_select("payer", "Payer", sd, ~Payer)
+filter_select("fac", "Facility", sd, ~Facility)
+```
+
+Row {data-height=350}
+-------------------------------------
+
+### Open items by owner and reason
+
+```{r}
+open_items |>
+  count(owner, result) |>
+  plot_ly(x = ~owner, y = ~n, color = ~result, colors = reason_cols, type = "bar",
+          text = ~paste0(result, ": ", n), hoverinfo = "text", textposition = "none") |>
+  plot_layout(barmode = "stack", xaxis = list(title = ""), yaxis = list(title = "Deposits"))
+```
+
+### Open items by age
+
+```{r}
+open_items |>
+  group_by(age_bucket, result) |>
+  summarise(unposted = sum(pmax(unposted, 0)), n = n(), .groups = "drop") |>
+  plot_ly(x = ~age_bucket, y = ~n, color = ~result, colors = reason_cols, type = "bar",
+          text = ~paste0(result, ": ", n, " deposits, ", money(unposted), " unposted"),
+          hoverinfo = "text", textposition = "none") |>
+  plot_layout(barmode = "stack", xaxis = list(title = ""), yaxis = list(title = "Deposits"))
+```
+
+Row
+-------------------------------------
+
+### Open deposit detail
+
+```{r}
+datatable(sd, rownames = FALSE, extensions = "Buttons",
+          options = list(dom = "Bfrtip", pageLength = 12, scrollX = TRUE,
+                         buttons = list(
+                           list(extend = "excel", title = "Open deposit items", text = "Excel"),
+                           list(extend = "csv", text = "CSV"))),
+          class = "compact stripe") |>
+  formatCurrency(c("Deposited", "Posted", "Unposted"), digits = 2) |>
+  formatDate("Deposit date", method = "toLocaleDateString")
+```
+
+Match rates by payer
+=====================================
+
+Row
+-------------------------------------
+
+### Share of deposits matched, by payer
+
+```{r}
+m |>
+  group_by(payer_name) |>
+  summarise(rate = mean(result == "Matched"), n = n(), .groups = "drop") |>
+  arrange(rate) |>
+  mutate(payer_name = factor(payer_name, payer_name)) |>
+  plot_ly(y = ~payer_name, x = ~rate, type = "bar", orientation = "h",
+          marker = list(color = "#1B365D"),
+          text = ~paste0(pct(rate), " of ", n, " deposits"), hoverinfo = "text",
+          textposition = "none") |>
+  plot_layout(xaxis = list(title = "", tickformat = ".0%", range = c(0.8, 1)),
+              yaxis = list(title = ""))
+```
+
+### Open deposits by business day
+
+```{r}
+plot_ly(trend, x = ~day) |>
+  add_bars(y = ~open_deposits, name = "Open deposits", marker = list(color = "#6C8EBF")) |>
+  add_bars(y = ~aged_deposits, name = "Open over 30 days", marker = list(color = "#B5473A")) |>
+  plot_layout(barmode = "overlay", xaxis = list(title = ""), yaxis = list(title = "Deposits"))
+```
+
+Data checks
+=====================================
+
+Row
+-------------------------------------
+
+### Pipeline validation
+
+Every render runs these checks first. If any fails, the pipeline stops and no dashboard is published.
+
+```{r}
+checks |>
+  mutate(Result = ifelse(passed, "Pass", "Fail")) |>
+  select(Check = check, Result) |>
+  datatable(rownames = FALSE, options = list(dom = "t", pageLength = 20),
+            class = "compact") |>
+  formatStyle("Result", color = styleEqual(c("Pass", "Fail"), c("#2E7D32", "#B5473A")),
+              fontWeight = "bold")
+```
+
+### About this dashboard
+
+All data is **synthetic**: generated by `R/generate_synthetic_data.R` with a fixed seed. No real patients, accounts, payers, facilities or bank references are represented.
+
+**Matching** runs in DuckDB SQL over Parquet: first by bank reference, then by payer, amount and a 10 day date window for lockbox checks posted without a reference. Anything left is an open item with an owner and a reason.
+
+**Trend** rebuilds the unposted position for every business day from the posting history, so the effect of the daily report launch on `r format(launch, "%b %d, %Y")` is measured, not estimated.
+
+**Source:** [github.com/danielpatterson1/cash-posting-reconciliation](https://github.com/danielpatterson1/cash-posting-reconciliation)
